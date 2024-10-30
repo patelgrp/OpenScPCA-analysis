@@ -4,7 +4,7 @@ library(infercnv)
 library(dplyr)
 library(SingleCellExperiment)
 library(scCustomize)
-library(SCEVAN)
+options(Seurat.object.assay.version = "v5")
 
 #define folder with unzipped datasets from ALSF scPCA retinoblastoma cohort (SCPCP000011)
 dir <- "/mnt/6TB/GITHUB_REPOS/OpenScPCA-analysis/data/RB/SCPCP000011_SINGLE-CELL_SINGLE-CELL-EXPERIMENT_2024-10-16/"
@@ -40,11 +40,15 @@ for (i in 1:length(rownames(sample.metadata)))
   newgenes <- newgenes[!duplicated(newgenes$gene_symbol), ]
   sample.sce.object <- sample.sce.object[newgenes$gene_ids, ]
   rownames(sample.sce.object) <- rowData(sample.sce.object)$gene_symbol
+  #add library id to avoid cell barcode overlap
+  colnames(sample.sce.object) <- paste(sample.metadata$scpca_library_id[i],
+                                       colnames(sample.sce.object),
+                                       sep = "_")
   
   #convert sce to seurat object
   sample.seurat.object[[i]] <- as.Seurat(sample.sce.object)
   
-  #assign metadata to the seurat objects (will be useful later!)
+  #assign metadata to the seurat objects (probably overkill, but hopefully will be useful later!)
   sample.seurat.object[[i]]$scpca_project_id <- sample.metadata$scpca_project_id[i]
   sample.seurat.object[[i]]$scpca_sample_id <- sample.metadata$scpca_sample_id[i]
   sample.seurat.object[[i]]$scpca_library_id <- sample.metadata$scpca_library_id[i]
@@ -95,21 +99,65 @@ for (i in 1:length(rownames(sample.metadata)))
   sample.seurat.object[[i]]$workflow_version <- sample.metadata$workflow_version[i]
   sample.seurat.object[[i]]$workflow_commit <- sample.metadata$workflow_commit[i]
   
+  #create a list of the count matrices (useful for downstream inference of CNV)
   cntmatrix.list[[i]] <- sample.seurat.object[[i]]@assays$originalexp@counts
   
   remove(sample.sce.object, newgenes)
 }
 
+#Our overall strategy uses 3 pieces of information to annotate samples based on malignant status
+#1. we do a simple merge (no batch correction or integration) to determine intermixing of cells and assign a
+#LISI score (a la Korsunsky et al Nat Methods 2019). Non-malignant cells will intermix more than malignant cells
+#2. we use auto-annotations (already computed by the scPCA pipeline using singleR and cellassign) to
+#annotate immune and endothelial cells (which we can safely presume are not malignant)
+#3. (most onerous) we use inferCNV using a normal tissue reference to identify cells/clusters with CNVs
+
+#create a merge of all data - weird intermittent bug with indexing
+# sample.merge <- merge(sample.seurat.object[[1]], sample.seurat.object[2:length(sample.seurat.object)], merge.dr = TRUE)
+#
+# #process merged data using standard Seurat pipeline
+# sample.merge <- NormalizeData(sample.merge)
+# sample.merge <- FindVariableFeatures(sample.merge)
+# sample.merge <- ScaleData(sample.merge)
+# sample.merge <- RunPCA(sample.merge, reduction.name = "merge.pca")
+# sample.merge <- FindNeighbors(sample.merge, dims = 1:30, reduction = "merge.pca")
+# sample.merge <- FindClusters(sample.merge, resolution = 0.2, cluster.name = "merge_cluster")
+# sample.merge <- RunUMAP(
+#   sample.merge,
+#   dims = 1:30,
+#   reduction = "merge.pca",
+#   reduction.name = "merge.umap"
+# )
+#
+# #compute LISI index for each cell/nucleus across sample mixing
+# metadata_id <- sample.merge$scpca_library_id
+# metadata_id <- data.frame(metadata_id)
+# colnames(metadata_id) <- "scpca_library_id"
+# merge.lisi <- compute_lisi(
+#   X = Embeddings(sample.merge, reduction = "merge.umap"),
+#   meta_data = metadata_id,
+#   label_colnames = "scpca_library_id"
+# )
+# sample.merge <- AddMetaData(sample.merge, metadata = merge.lisi, col.name = "merge_lisi")
+# saveRDS(sample.merge, file = "/mnt/6TB/GITHUB_REPOS/OpenScPCA-analysis/data/RB/SCPCP000011_SINGLE-CELL_SINGLE-CELL-EXPERIMENT_2024-10-16/merged RB Seurat objects.Rds")
+
+sample.merge <- readRDS(file = "/mnt/6TB/GITHUB_REPOS/OpenScPCA-analysis/scripts/merged RB Seurat objects.Rds")
 #start by running infercnv on each sample, using a fetal retina dataset as a reference
 #import count matrix from developing retina dataset from Norrie et al Nat Comms 2021 (GSE116106)
-retina_ref <- Read10X(data.dir = "/mnt/6TB/GITHUB_REPOS/OpenScPCA-analysis/data/RB/GSE116106_retina_reference")
-retina_ref <- retina_ref[, sample(colnames(retina_ref), 5000)]
-dir.create(paste0(dir, "RB_infercnv/"))
+# retina_ref <- Read10X(data.dir = "/mnt/6TB/GITHUB_REPOS/OpenScPCA-analysis/data/RB/GSE116106_retina_reference")
+# retina_ref <- retina_ref[, sample(colnames(retina_ref), 5000)]
+# saveRDS(retina_ref, file = "/mnt/6TB/GITHUB_REPOS/OpenScPCA-analysis/data/RB/retina_ref.RDS")
 
-for (i in 1:length(rownames(sample.metadata)))
+retina_ref <- readRDS(file = "/mnt/6TB/GITHUB_REPOS/OpenScPCA-analysis/data/RB/retina_ref.RDS")
+dir.create(paste0(dir, "RB_infercnv/"))
+remove(sample.seurat.object)
+updated.seurat.list <- list()
+
+for (i in 27:length(rownames(sample.metadata)))
 {
-  
-  combined_matrix <- sample.seurat.object[[i]]@assays$originalexp@counts
+  updated.seurat.list[[i]] <- subset(sample.merge,
+                                     scpca_library_id == sample.metadata$scpca_library_id[i])
+  combined_matrix <- cntmatrix.list[[i]]
   gene_subset <- intersect(rownames(combined_matrix), rownames(retina_ref))
   
   retina_ref_subset <- retina_ref[gene_subset, ]
@@ -119,15 +167,14 @@ for (i in 1:length(rownames(sample.metadata)))
   write.table(
     combined_matrix,
     file = paste0(dir, sample.metadata$scpca_library_id[i], "_matrix.txt"),
-    sep = "\t",
-    quote = F,
+     quote = F,
     col.names = colnames(combined_matrix)
   )
   
   reference_annotation <- data.frame(row.names = colnames(retina_ref_subset))
   reference_annotation$annotation = 'reference'
-  tumor_annotation <- data.frame(row.names = Cells(sample.seurat.object[[i]]),
-                                 annotation = sample.seurat.object[[i]]$cluster)
+  tumor_annotation <- data.frame(row.names = Cells(updated.seurat.list[[i]]),
+                                 annotation = updated.seurat.list[[i]]$cluster)
   annotation_table <- rbind(reference_annotation, tumor_annotation)
   write.table(
     annotation_table,
@@ -151,7 +198,7 @@ for (i in 1:length(rownames(sample.metadata)))
     cluster_by_groups = TRUE,
     analysis_mode = "samples",
     denoise = TRUE,
-    HMM = FALSE,
+    HMM = FALSE
   )
   
   pdf(
@@ -162,19 +209,86 @@ for (i in 1:length(rownames(sample.metadata)))
       "/umap_plots.pdf"
     )
   )
-  print(DimPlot(sample.seurat.object[[i]], group.by = "cluster"))
-  print(DimPlot(sample.seurat.object[[i]], group.by = "singler_celltype_annotation"))
-  print(DimPlot(sample.seurat.object[[i]], group.by = "cellassign_celltype_annotation"))
-  print(DimPlot(sample.seurat.object[[i]], group.by = "is_xenograft"))
+  print(DimPlot(
+    updated.seurat.list[[i]],
+    group.by = "cluster",
+    reduction = "UMAP"
+  ))
+  print(
+    DimPlot(
+      updated.seurat.list[[i]],
+      group.by = "singler_celltype_annotation",
+      reduction = "UMAP",
+      label = TRUE
+    ) + NoLegend()
+  )
+  print(
+    DimPlot(
+      updated.seurat.list[[i]],
+      group.by = "cellassign_celltype_annotation",
+      reduction = "UMAP",
+      label = TRUE
+    ) + NoLegend()
+  )
+  print(DimPlot(
+    updated.seurat.list[[i]],
+    group.by = "is_xenograft",
+    reduction = "UMAP"
+  ))
+  print(
+    FeaturePlot(
+      updated.seurat.list[[i]],
+      features = c("VWF"),
+      reduction = "UMAP",
+      min.cutoff = "q5",
+      max.cutoff = "q95",
+      cols = c("lightgrey", "darkblue"),
+      order = TRUE
+    )
+  )
+  print(
+    FeaturePlot(
+      updated.seurat.list[[i]],
+      features = c("PTPRC"),
+      reduction = "UMAP",
+      min.cutoff = "q5",
+      max.cutoff = "q95",
+      cols = c("lightgrey", "darkblue"),
+      order = TRUE
+    )
+  )
+  print(
+    FeaturePlot(
+      updated.seurat.list[[i]],
+      features = c("COL1A1"),
+      reduction = "UMAP",
+      min.cutoff = "q5",
+      max.cutoff = "q95",
+      cols = c("lightgrey", "darkblue"),
+      order = TRUE
+    )
+  )
+  print(
+    FeaturePlot(
+      updated.seurat.list[[i]],
+      features = c("merge_lisi"),
+      reduction = "UMAP",
+      min.cutoff = "q5",
+      max.cutoff = "q95",
+      cols = c("lightgrey", "darkblue"),
+      order = TRUE
+    )
+  )
   dev.off()
   
-  setwd(paste0(dir, "RB_infercnv/"))
-  scevan.results <- pipelineCNA(
-    count_mtx = combined_matrix,
-    norm_cell = rownames(reference_annotation),
-    SUBCLONES = F,
-    sample = paste0("SCEVAN_", sample.metadata$scpca_library_id[i])
-  )
+  # setwd(paste0(dir, "RB_infercnv/"))
+  # try(scevan.results <- pipelineCNA(
+  #   count_mtx = updated.seurat.list[[i]]@assays$originalexp@counts,
+  #   norm_cell = NULL,
+  #   SUBCLONES = F,
+  #   sample = paste0("SCEVAN_", sample.metadata$scpca_library_id[i]),
+  #   par_cores = 4,
+  # ))
   
   
   remove(
@@ -184,16 +298,49 @@ for (i in 1:length(rownames(sample.metadata)))
     retina_ref_subset,
     reference_annotation,
     tumor_annotation,
-    annotation_table, 
-    scevan.results
+    annotation_table
   )
 }
 
+reticulate::use_condaenv("scvi-env", required = TRUE)
+sc <- import("scanpy", convert = FALSE)
+scvi <- import("scvi", convert = FALSE)
 
+temp_Seurat <- sample.merge
+temp_Seurat[["RNA"]] <- as(object = temp_Seurat[["RNA"]], Class = "Assay")
+merge_adata <- convertFormat(
+  temp_Seurat,
+  from = "seurat",
+  to = "anndata",
+  main_layer = "counts",
+  drop_single_values = FALSE
+)
+remove(temp_Seurat)
 
-#Our overall strategy uses 3 pieces of information to annotate samples based on malignant status
-#1. we do a simple merge (no batch correction or integration) to determine intermixing of cells and assign a
-#LISI score (a la Korsunsky et al Nat Methods 2019). Non-malignant cells will intermix more than malignant cells
-#2. we use auto-annotations (already computed by the scPCA pipeline using singleR and cellassign) to
-#annotate immune and endothelial cells (which we can safely presume are not malignant)
-#3. (most onerous) we use inferCNV using a normal tissue reference to identify cells/clusters with CNVs
+#batches <- c('sample_id', 'Method')
+scvi$model$SCVI$setup_anndata(
+  merge_adata,
+  batch_key = "sample_id",
+  categorical_covariate_keys = list("Method")
+)
+model <- scvi$model$SCVI(adata = merge_adata)
+model$train(accelerator = "gpu")#, max_epochs = 10L)
+latent = model$get_latent_representation()
+latent <- as.matrix(latent)
+rownames(latent) = colnames(sample.merge)
+
+saveRDS(model, file = paste0("scVI_model.Rds"))
+saveRDS(latent, file = paste0("/scVI_latent_reps.Rds"))
+
+sample.merge[["integrated.scvi"]] <- CreateDimReducObject(embeddings = latent,
+                                                          key = "scvi_",
+                                                          assay = DefaultAssay(sample.merge))
+
+sample.merge <- FindNeighbors(sample.merge, reduction = "integrated.scvi", dims = 1:10)
+sample.merge <- FindClusters(sample.merge, resolution = 0.4, cluster.name = "scvi_clusters")
+sample.merge <- RunUMAP(
+  sample.merge,
+  reduction = "integrated.scvi",
+  dims = 1:10,
+  reduction.name = "umap.scvi"
+)
